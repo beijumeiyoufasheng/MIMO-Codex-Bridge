@@ -33,7 +33,7 @@ import uvicorn
 
 # 配置日志
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
@@ -201,31 +201,12 @@ def responses_to_chat_completions(body: dict) -> dict:
             if isinstance(item, str):
                 messages.append({"role": "user", "content": item})
             elif isinstance(item, dict):
-                role = item.get("role", "user")
-                content = item.get("content", "")
-
-                # 处理 Responses API 的 content 数组格式
-                if isinstance(content, list):
-                    text_parts = []
-                    for part in content:
-                        if isinstance(part, dict):
-                            if part.get("type") in ("output_text", "input_text"):
-                                text_parts.append(part.get("text", ""))
-                        elif isinstance(part, str):
-                            text_parts.append(part)
-                    content = "\n".join(text_parts)
-
-                msg = {"role": role, "content": content}
-
-                # 保留 reasoning_content（MIMO 思考模式必需）
-                if "reasoning_content" in item:
-                    msg["reasoning_content"] = item["reasoning_content"]
-
-                # 保留 tool_calls
-                if "tool_calls" in item:
-                    msg["tool_calls"] = item["tool_calls"]
-
-                messages.append(msg)
+                converted = _convert_input_item(item)
+                if converted:
+                    if isinstance(converted, list):
+                        messages.extend(converted)
+                    else:
+                        messages.append(converted)
 
     # 处理 instructions（系统提示词）
     instructions = body.get("instructions")
@@ -258,6 +239,93 @@ def responses_to_chat_completions(body: dict) -> dict:
         result["tool_choice"] = body["tool_choice"]
 
     return result
+
+
+def _convert_input_item(item: dict) -> dict | list[dict] | None:
+    """转换 Responses input item 到 Chat Completions message"""
+    item_type = item.get("type")
+
+    if item_type in ("function_call_output", "tool_result"):
+        return {
+            "role": "tool",
+            "tool_call_id": item.get("call_id") or item.get("tool_call_id") or item.get("id", ""),
+            "content": _stringify_tool_output(item.get("output", item.get("content", ""))),
+        }
+
+    if item_type in ("function_call", "tool_call"):
+        return {
+            "role": "assistant",
+            "content": item.get("content") or "",
+            "tool_calls": [_responses_tool_call_to_chat(item)],
+        }
+
+    role = item.get("role", "user")
+    content = _extract_content_text(item.get("content", ""))
+    msg = {"role": role, "content": content}
+
+    if "reasoning_content" in item:
+        msg["reasoning_content"] = item["reasoning_content"]
+
+    if "tool_calls" in item:
+        msg["tool_calls"] = [_responses_tool_call_to_chat(tc) for tc in item["tool_calls"]]
+
+    return msg
+
+
+def _extract_content_text(content: Any) -> str:
+    """提取 Responses content 文本"""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content) if content is not None else ""
+
+    text_parts = []
+    for part in content:
+        if isinstance(part, dict):
+            part_type = part.get("type")
+            if part_type in ("output_text", "input_text", "text"):
+                text_parts.append(part.get("text", ""))
+            elif part_type == "function_call":
+                text_parts.append(part.get("arguments", ""))
+        elif isinstance(part, str):
+            text_parts.append(part)
+    return "\n".join(text_parts)
+
+
+def _stringify_tool_output(output: Any) -> str:
+    """将工具输出转为字符串"""
+    if isinstance(output, str):
+        return output
+    return json.dumps(output, ensure_ascii=False)
+
+
+def _responses_tool_call_to_chat(tool_call: dict) -> dict:
+    """将 Responses function_call 转为 Chat Completions tool_call"""
+    function = tool_call.get("function", {})
+    name = tool_call.get("name") or function.get("name", "")
+    arguments = tool_call.get("arguments") or function.get("arguments", "{}")
+
+    return {
+        "id": tool_call.get("call_id") or tool_call.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": arguments if isinstance(arguments, str) else json.dumps(arguments, ensure_ascii=False),
+        },
+    }
+
+
+def _chat_tool_call_to_responses(tool_call: dict) -> dict:
+    """将 Chat Completions tool_call 转为 Responses function_call"""
+    function = tool_call.get("function", {})
+    return {
+        "type": "function_call",
+        "id": tool_call.get("id", ""),
+        "call_id": tool_call.get("id", ""),
+        "name": function.get("name", ""),
+        "arguments": function.get("arguments", "{}"),
+        "status": "completed",
+    }
 
 
 def _convert_tools(tools: list[dict]) -> list[dict]:
@@ -342,17 +410,12 @@ def chat_response_to_responses(resp: dict) -> dict:
         "content": output_content,
     }
 
-    # 处理 tool_calls
+    output = []
+    if output_content or not tool_calls:
+        output.append(output_item)
+
     if tool_calls:
-        for tc in tool_calls:
-            output_item["content"].append({
-                "type": "tool_call",
-                "id": tc.get("id", ""),
-                "function": {
-                    "name": tc.get("function", {}).get("name", ""),
-                    "arguments": tc.get("function", {}).get("arguments", ""),
-                },
-            })
+        output.extend(_chat_tool_call_to_responses(tc) for tc in tool_calls)
 
     return {
         "id": response_id,
@@ -360,9 +423,30 @@ def chat_response_to_responses(resp: dict) -> dict:
         "created_at": int(time.time()),
         "status": "completed",
         "model": resp.get("model", "mimo"),
-        "output": [output_item],
+        "output": output,
         "usage": resp.get("usage", {}),
     }
+
+
+def _merge_tool_call_deltas(collected_tool_calls: list[dict], tool_call_deltas: list[dict]):
+    """聚合 Chat Completions 流式 tool_call delta"""
+    for delta in tool_call_deltas:
+        index = delta.get("index", len(collected_tool_calls))
+        while len(collected_tool_calls) <= index:
+            collected_tool_calls.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+
+        target = collected_tool_calls[index]
+        if delta.get("id"):
+            target["id"] = delta["id"]
+        if delta.get("type"):
+            target["type"] = delta["type"]
+
+        function_delta = delta.get("function") or {}
+        target_function = target.setdefault("function", {"name": "", "arguments": ""})
+        if function_delta.get("name"):
+            target_function["name"] += function_delta["name"]
+        if function_delta.get("arguments"):
+            target_function["arguments"] += function_delta["arguments"]
 
 
 async def stream_chat_completions(
@@ -383,6 +467,7 @@ async def stream_chat_completions(
 
     collected_content = []
     collected_reasoning = []
+    collected_tool_calls = []
     has_reasoning = False
     has_content = False
     content_index = 0
@@ -426,6 +511,11 @@ async def stream_chat_completions(
                             collected_reasoning.append(reasoning)
                             yield f"data: {json.dumps({'type': 'response.reasoning_text.delta', 'output_index': 0, 'content_index': 0, 'delta': reasoning}, ensure_ascii=False)}\n\n"
 
+                        # 处理 tool_calls
+                        tool_call_deltas = delta.get("tool_calls") or []
+                        if tool_call_deltas:
+                            _merge_tool_call_deltas(collected_tool_calls, tool_call_deltas)
+
                         # 处理 content
                         content = delta.get("content")
                         if content:
@@ -448,6 +538,11 @@ async def stream_chat_completions(
                                 yield f"data: {json.dumps({'type': 'response.content_part.done', 'output_index': 0, 'content_index': 0, 'part': {'type': 'reasoning_text', 'text': ''.join(collected_reasoning)}}, ensure_ascii=False)}\n\n"
 
                             yield f"data: {json.dumps({'type': 'response.output_item.done', 'output_index': 0, 'item': {'type': 'message', 'id': message_id, 'role': 'assistant', 'status': 'completed', 'content': []}}, ensure_ascii=False)}\n\n"
+
+                            for tool_index, tool_call in enumerate(collected_tool_calls, start=1):
+                                responses_tool_call = _chat_tool_call_to_responses(tool_call)
+                                yield f"data: {json.dumps({'type': 'response.output_item.added', 'output_index': tool_index, 'item': responses_tool_call}, ensure_ascii=False)}\n\n"
+                                yield f"data: {json.dumps({'type': 'response.output_item.done', 'output_index': tool_index, 'item': responses_tool_call}, ensure_ascii=False)}\n\n"
 
                     except json.JSONDecodeError:
                         continue
@@ -495,6 +590,8 @@ async def stream_chat_completions(
                 "text": "".join(collected_content),
                 "annotations": [],
             })
+        if collected_tool_calls:
+            completed_response["output"].extend(_chat_tool_call_to_responses(tc) for tc in collected_tool_calls)
 
         yield f"data: {json.dumps({'type': 'response.completed', 'response': completed_response}, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
@@ -614,7 +711,6 @@ async def handle_responses(request: Request):
     }
 
     logger.info(f"转发请求到 {url} (stream={req.stream})")
-    logger.debug(f"请求体: {json.dumps(chat_payload, ensure_ascii=False, indent=2)}")
 
     # 注意：流式响应时不能使用 async with，因为客户端会在 StreamingResponse 返回前被关闭
     client = httpx.AsyncClient(timeout=300.0)

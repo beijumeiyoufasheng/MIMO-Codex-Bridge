@@ -9,6 +9,7 @@ from proxy import (
     get_backend_url,
     MIMO_ENDPOINTS,
     _convert_tools,
+    _merge_tool_call_deltas,
 )
 
 
@@ -80,6 +81,20 @@ def test_responses_to_chat_completions():
     assert result5["messages"][0].get("reasoning_content") == "Thinking process here"
     print("[PASS] 测试 5 - reasoning_content 保留")
 
+    # 测试 6: 工具结果回传
+    test6 = {
+        "input": [
+            {"type": "function_call", "call_id": "call_123", "name": "get_weather", "arguments": '{"location":"Beijing"}'},
+            {"type": "function_call_output", "call_id": "call_123", "output": "Sunny 25C"},
+        ]
+    }
+    result6 = responses_to_chat_completions(test6)
+    assert result6["messages"][0]["role"] == "assistant"
+    assert result6["messages"][0]["tool_calls"][0]["id"] == "call_123"
+    assert result6["messages"][1]["role"] == "tool"
+    assert result6["messages"][1]["tool_call_id"] == "call_123"
+    print("[PASS] 测试 6 - 工具结果回传")
+
 
 def test_chat_response_to_responses():
     """测试 Chat Completions 到 Responses API 的转换"""
@@ -136,8 +151,9 @@ def test_chat_response_to_responses():
         }]
     }
     result3 = chat_response_to_responses(test3)
-    assert result3["output"][0]["content"][0]["type"] == "tool_call"
-    assert result3["output"][0]["content"][0]["id"] == "call_123"
+    assert result3["output"][0]["type"] == "function_call"
+    assert result3["output"][0]["call_id"] == "call_123"
+    assert result3["output"][0]["name"] == "get_weather"
     print("[PASS] 测试 3 - 带 tool_calls")
 
 
@@ -174,6 +190,27 @@ def test_convert_tools():
     assert result_cc[0]["function"]["name"] == "get_weather"
     print("[PASS] 测试 Chat Completions 格式透传")
 
+    # 测试过滤不支持的内置工具
+    unsupported_tools = [{"type": "web_search", "external_web_access": False}]
+    result_unsupported = _convert_tools(unsupported_tools)
+    assert result_unsupported == []
+    print("[PASS] 测试过滤不支持的内置工具")
+
+
+def test_merge_tool_call_deltas():
+    """测试流式 tool_call delta 聚合"""
+    print("\n=== 测试流式 Tool Call 聚合 ===\n")
+
+    collected = []
+    _merge_tool_call_deltas(collected, [{"index": 0, "id": "call_123", "type": "function", "function": {"name": "get_"}}])
+    _merge_tool_call_deltas(collected, [{"index": 0, "function": {"name": "weather", "arguments": '{"location"'}}])
+    _merge_tool_call_deltas(collected, [{"index": 0, "function": {"arguments": ':"Beijing"}'}}])
+
+    assert collected[0]["id"] == "call_123"
+    assert collected[0]["function"]["name"] == "get_weather"
+    assert collected[0]["function"]["arguments"] == '{"location":"Beijing"}'
+    print("[PASS] 测试流式 tool_call delta 聚合")
+
 
 def test_api_key_detection():
     """测试 API Key 类型检测"""
@@ -196,5 +233,6 @@ if __name__ == "__main__":
     test_responses_to_chat_completions()
     test_chat_response_to_responses()
     test_convert_tools()
+    test_merge_tool_call_deltas()
     test_api_key_detection()
     print("\n[OK] 所有测试完成")
