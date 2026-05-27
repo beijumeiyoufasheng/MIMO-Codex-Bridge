@@ -367,115 +367,119 @@ async def stream_chat_completions(
     content_index = 0
 
     try:
-        async with client.stream("POST", url, json=payload, headers=headers) as response:
-            # 检查响应状态
-            if response.status_code != 200:
-                error_body = await response.aread()
-                error_msg = error_body.decode("utf-8", errors="replace")
-                logger.error(f"后端返回错误 {response.status_code}: {error_msg}")
-                yield f"data: {json.dumps({'type': 'response.error', 'error': {'type': 'backend_error', 'code': response.status_code, 'message': error_msg}}, ensure_ascii=False)}\n\n"
-                yield "data: [DONE]\n\n"
-                return
+        try:
+            async with client.stream("POST", url, json=payload, headers=headers) as response:
+                # 检查响应状态
+                if response.status_code != 200:
+                    error_body = await response.aread()
+                    error_msg = error_body.decode("utf-8", errors="replace")
+                    logger.error(f"后端返回错误 {response.status_code}: {error_msg}")
+                    yield f"data: {json.dumps({'type': 'response.error', 'error': {'type': 'backend_error', 'code': response.status_code, 'message': error_msg}}, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
 
-            async for line in response.aiter_lines():
-                if not line.startswith("data: "):
-                    continue
-
-                data = line[6:]
-                if data.strip() == "[DONE]":
-                    break
-
-                try:
-                    chunk = json.loads(data)
-                    choices = chunk.get("choices", [])
-                    if not choices:
+                async for line in response.aiter_lines():
+                    if not line.startswith("data: "):
                         continue
 
-                    delta = choices[0].get("delta", {})
-                    finish_reason = choices[0].get("finish_reason")
+                    data = line[6:]
+                    if data.strip() == "[DONE]":
+                        break
 
-                    # 处理 reasoning_content（MIMO 思考模式）
-                    reasoning = delta.get("reasoning_content")
-                    if reasoning:
-                        if not has_reasoning:
-                            has_reasoning = True
-                            yield f"data: {json.dumps({'type': 'response.content_part.added', 'output_index': 0, 'content_index': 0, 'part': {'type': 'reasoning_text', 'text': ''}}, ensure_ascii=False)}\n\n"
+                    try:
+                        chunk = json.loads(data)
+                        choices = chunk.get("choices", [])
+                        if not choices:
+                            continue
 
-                        collected_reasoning.append(reasoning)
-                        yield f"data: {json.dumps({'type': 'response.reasoning_text.delta', 'output_index': 0, 'content_index': 0, 'delta': reasoning}, ensure_ascii=False)}\n\n"
+                        delta = choices[0].get("delta", {})
+                        finish_reason = choices[0].get("finish_reason")
 
-                    # 处理 content
-                    content = delta.get("content")
-                    if content:
-                        if not has_content and has_reasoning:
-                            yield f"data: {json.dumps({'type': 'response.content_part.done', 'output_index': 0, 'content_index': 0, 'part': {'type': 'reasoning_text', 'text': ''.join(collected_reasoning)}}, ensure_ascii=False)}\n\n"
-                            content_index = 1
-                            yield f"data: {json.dumps({'type': 'response.content_part.added', 'output_index': 0, 'content_index': content_index, 'part': {'type': 'output_text', 'text': '', 'annotations': []}}, ensure_ascii=False)}\n\n"
-                        elif not has_content:
-                            yield f"data: {json.dumps({'type': 'response.content_part.added', 'output_index': 0, 'content_index': 0, 'part': {'type': 'output_text', 'text': '', 'annotations': []}}, ensure_ascii=False)}\n\n"
+                        # 处理 reasoning_content（MIMO 思考模式）
+                        reasoning = delta.get("reasoning_content")
+                        if reasoning:
+                            if not has_reasoning:
+                                has_reasoning = True
+                                yield f"data: {json.dumps({'type': 'response.content_part.added', 'output_index': 0, 'content_index': 0, 'part': {'type': 'reasoning_text', 'text': ''}}, ensure_ascii=False)}\n\n"
 
-                        has_content = True
-                        collected_content.append(content)
-                        yield f"data: {json.dumps({'type': 'response.output_text.delta', 'output_index': 0, 'content_index': content_index, 'delta': content}, ensure_ascii=False)}\n\n"
+                            collected_reasoning.append(reasoning)
+                            yield f"data: {json.dumps({'type': 'response.reasoning_text.delta', 'output_index': 0, 'content_index': 0, 'delta': reasoning}, ensure_ascii=False)}\n\n"
 
-                    # 处理完成
-                    if finish_reason:
-                        if has_content:
-                            yield f"data: {json.dumps({'type': 'response.content_part.done', 'output_index': 0, 'content_index': content_index, 'part': {'type': 'output_text', 'text': ''.join(collected_content), 'annotations': []}}, ensure_ascii=False)}\n\n"
-                        elif has_reasoning:
-                            yield f"data: {json.dumps({'type': 'response.content_part.done', 'output_index': 0, 'content_index': 0, 'part': {'type': 'reasoning_text', 'text': ''.join(collected_reasoning)}}, ensure_ascii=False)}\n\n"
+                        # 处理 content
+                        content = delta.get("content")
+                        if content:
+                            if not has_content and has_reasoning:
+                                yield f"data: {json.dumps({'type': 'response.content_part.done', 'output_index': 0, 'content_index': 0, 'part': {'type': 'reasoning_text', 'text': ''.join(collected_reasoning)}}, ensure_ascii=False)}\n\n"
+                                content_index = 1
+                                yield f"data: {json.dumps({'type': 'response.content_part.added', 'output_index': 0, 'content_index': content_index, 'part': {'type': 'output_text', 'text': '', 'annotations': []}}, ensure_ascii=False)}\n\n"
+                            elif not has_content:
+                                yield f"data: {json.dumps({'type': 'response.content_part.added', 'output_index': 0, 'content_index': 0, 'part': {'type': 'output_text', 'text': '', 'annotations': []}}, ensure_ascii=False)}\n\n"
 
-                        yield f"data: {json.dumps({'type': 'response.output_item.done', 'output_index': 0, 'item': {'type': 'message', 'id': message_id, 'role': 'assistant', 'status': 'completed', 'content': []}}, ensure_ascii=False)}\n\n"
+                            has_content = True
+                            collected_content.append(content)
+                            yield f"data: {json.dumps({'type': 'response.output_text.delta', 'output_index': 0, 'content_index': content_index, 'delta': content}, ensure_ascii=False)}\n\n"
 
-                except json.JSONDecodeError:
-                    continue
+                        # 处理完成
+                        if finish_reason:
+                            if has_content:
+                                yield f"data: {json.dumps({'type': 'response.content_part.done', 'output_index': 0, 'content_index': content_index, 'part': {'type': 'output_text', 'text': ''.join(collected_content), 'annotations': []}}, ensure_ascii=False)}\n\n"
+                            elif has_reasoning:
+                                yield f"data: {json.dumps({'type': 'response.content_part.done', 'output_index': 0, 'content_index': 0, 'part': {'type': 'reasoning_text', 'text': ''.join(collected_reasoning)}}, ensure_ascii=False)}\n\n"
 
-    except httpx.ConnectError as e:
-        logger.error(f"连接后端失败: {e}")
-        yield f"data: {json.dumps({'type': 'response.error', 'error': {'type': 'connection_error', 'message': f'连接后端失败: {str(e)}'}}, ensure_ascii=False)}\n\n"
-        yield "data: [DONE]\n\n"
-        return
-    except httpx.TimeoutException as e:
-        logger.error(f"请求超时: {e}")
-        yield f"data: {json.dumps({'type': 'response.error', 'error': {'type': 'timeout_error', 'message': f'请求超时: {str(e)}'}}, ensure_ascii=False)}\n\n"
-        yield "data: [DONE]\n\n"
-        return
-    except Exception as e:
-        logger.error(f"流式处理异常: {e}")
-        yield f"data: {json.dumps({'type': 'response.error', 'error': {'type': 'internal_error', 'message': str(e)}}, ensure_ascii=False)}\n\n"
-        yield "data: [DONE]\n\n"
-        return
+                            yield f"data: {json.dumps({'type': 'response.output_item.done', 'output_index': 0, 'item': {'type': 'message', 'id': message_id, 'role': 'assistant', 'status': 'completed', 'content': []}}, ensure_ascii=False)}\n\n"
 
-    # 发送 response.completed 事件
-    completed_response = {
-        "id": response_id,
-        "object": "response",
-        "created_at": int(time.time()),
-        "status": "completed",
-        "model": payload.get("model", "mimo"),
-        "output": [{
-            "type": "message",
-            "id": message_id,
-            "role": "assistant",
+                    except json.JSONDecodeError:
+                        continue
+
+        except httpx.ConnectError as e:
+            logger.error(f"连接后端失败: {e}")
+            yield f"data: {json.dumps({'type': 'response.error', 'error': {'type': 'connection_error', 'message': f'连接后端失败: {str(e)}'}}, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+        except httpx.TimeoutException as e:
+            logger.error(f"请求超时: {e}")
+            yield f"data: {json.dumps({'type': 'response.error', 'error': {'type': 'timeout_error', 'message': f'请求超时: {str(e)}'}}, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+        except Exception as e:
+            logger.error(f"流式处理异常: {e}")
+            yield f"data: {json.dumps({'type': 'response.error', 'error': {'type': 'internal_error', 'message': str(e)}}, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+        # 发送 response.completed 事件
+        completed_response = {
+            "id": response_id,
+            "object": "response",
+            "created_at": int(time.time()),
             "status": "completed",
-            "content": [],
-        }],
-    }
+            "model": payload.get("model", "mimo"),
+            "output": [{
+                "type": "message",
+                "id": message_id,
+                "role": "assistant",
+                "status": "completed",
+                "content": [],
+            }],
+        }
 
-    if collected_reasoning:
-        completed_response["output"][0]["content"].append({
-            "type": "reasoning_text",
-            "text": "".join(collected_reasoning),
-        })
-    if collected_content:
-        completed_response["output"][0]["content"].append({
-            "type": "output_text",
-            "text": "".join(collected_content),
-            "annotations": [],
-        })
+        if collected_reasoning:
+            completed_response["output"][0]["content"].append({
+                "type": "reasoning_text",
+                "text": "".join(collected_reasoning),
+            })
+        if collected_content:
+            completed_response["output"][0]["content"].append({
+                "type": "output_text",
+                "text": "".join(collected_content),
+                "annotations": [],
+            })
 
-    yield f"data: {json.dumps({'type': 'response.completed', 'response': completed_response}, ensure_ascii=False)}\n\n"
-    yield "data: [DONE]\n\n"
+        yield f"data: {json.dumps({'type': 'response.completed', 'response': completed_response}, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
+    finally:
+        # 确保客户端被关闭
+        await client.aclose()
 
 
 async def verify_admin_token(
@@ -590,9 +594,11 @@ async def handle_responses(request: Request):
 
     logger.info(f"转发请求到 {url} (stream={req.stream})")
 
-    async with httpx.AsyncClient(timeout=300.0) as client:
+    # 注意：流式响应时不能使用 async with，因为客户端会在 StreamingResponse 返回前被关闭
+    client = httpx.AsyncClient(timeout=300.0)
+    try:
         if chat_payload.get("stream"):
-            # 流式响应
+            # 流式响应 - 客户端会在生成器内部关闭
             return StreamingResponse(
                 stream_chat_completions(client, url, headers, chat_payload),
                 media_type="text/event-stream",
@@ -625,6 +631,11 @@ async def handle_responses(request: Request):
             except httpx.TimeoutException as e:
                 logger.error(f"请求超时: {e}")
                 raise HTTPException(status_code=504, detail=f"请求超时: {str(e)}")
+            finally:
+                await client.aclose()
+    except Exception:
+        await client.aclose()
+        raise
 
 
 @app.get("/v1/models")
