@@ -37,6 +37,12 @@ env/
 .DS_Store
 Thumbs.db
 
+# PyInstaller
+*.spec
+
+# Claude Code
+.claude/
+
 # Project specific
 *.db
 *.sqlite

@@ -1,0 +1,9 @@
+{
+  "name": "MIMO 按量付费",
+  "type": "codex",
+  "config": {
+    "base_url": "http://127.0.0.1:8888/v1",
+    "api_key": "sk-你的MIMO_API_KEY"
+  },
+  "notes": "按量付费模式，API Key 格式: sk-xxxxx"
+}

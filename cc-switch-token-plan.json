@@ -1,0 +1,9 @@
+{
+  "name": "MIMO Token Plan",
+  "type": "codex",
+  "config": {
+    "base_url": "http://127.0.0.1:8888/v1",
+    "api_key": "tp-你的MIMO_TOKEN_PLAN_KEY"
+  },
+  "notes": "Token Plan 模式，API Key 格式: tp-xxxxx"
+}
