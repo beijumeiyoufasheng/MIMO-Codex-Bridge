@@ -58,12 +58,14 @@ def test_responses_to_chat_completions():
                 "description": "Get weather info",
                 "parameters": {"type": "object", "properties": {"location": {"type": "string"}}}
             }
-        ]
+        ],
+        "tool_choice": {"type": "function", "name": "get_weather"},
     }
     result4 = responses_to_chat_completions(test4)
     assert "tools" in result4
     assert len(result4["tools"]) == 1
     assert result4["tools"][0]["function"]["name"] == "get_weather"
+    assert result4["tool_choice"]["function"]["name"] == "get_weather"
     print("[PASS] 测试 4 - 带 tools 参数")
 
     # 测试 5: reasoning_content 保留
@@ -195,6 +197,12 @@ def test_convert_tools():
     result_unsupported = _convert_tools(unsupported_tools)
     assert result_unsupported == []
     print("[PASS] 测试过滤不支持的内置工具")
+
+    # 测试过滤缺少 function.name 的工具
+    invalid_tools = [{"type": "function", "function": {"description": "missing name"}}]
+    result_invalid = _convert_tools(invalid_tools)
+    assert result_invalid == []
+    print("[PASS] 测试过滤缺少名称的工具")
 
 
 def test_merge_tool_call_deltas():

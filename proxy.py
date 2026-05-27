@@ -22,13 +22,12 @@ import logging
 import secrets
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional
-from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 import uvicorn
 
 # 配置日志
@@ -234,9 +233,11 @@ def responses_to_chat_completions(body: dict) -> dict:
 
     # 转换 tools 参数
     if "tools" in body and body["tools"]:
-        result["tools"] = _convert_tools(body["tools"])
-    if "tool_choice" in body and body["tool_choice"] is not None:
-        result["tool_choice"] = body["tool_choice"]
+        converted_tools = _convert_tools(body["tools"])
+        if converted_tools:
+            result["tools"] = converted_tools
+    if "tool_choice" in body and body["tool_choice"] is not None and result.get("tools"):
+        result["tool_choice"] = _convert_tool_choice(body["tool_choice"])
 
     return result
 
@@ -318,14 +319,22 @@ def _responses_tool_call_to_chat(tool_call: dict) -> dict:
 def _chat_tool_call_to_responses(tool_call: dict) -> dict:
     """将 Chat Completions tool_call 转为 Responses function_call"""
     function = tool_call.get("function", {})
+    call_id = tool_call.get("id") or f"call_{uuid.uuid4().hex[:24]}"
     return {
         "type": "function_call",
-        "id": tool_call.get("id", ""),
-        "call_id": tool_call.get("id", ""),
+        "id": call_id,
+        "call_id": call_id,
         "name": function.get("name", ""),
         "arguments": function.get("arguments", "{}"),
         "status": "completed",
     }
+
+
+def _convert_tool_choice(tool_choice: str | dict) -> str | dict:
+    """转换 Responses API tool_choice 到 Chat Completions 格式"""
+    if isinstance(tool_choice, dict) and tool_choice.get("type") == "function" and "name" in tool_choice:
+        return {"type": "function", "function": {"name": tool_choice["name"]}}
+    return tool_choice
 
 
 def _convert_tools(tools: list[dict]) -> list[dict]:
@@ -344,8 +353,11 @@ def _convert_tools(tools: list[dict]) -> list[dict]:
 
         if "function" in tool and isinstance(tool["function"], dict):
             # 已经是 Chat Completions 格式：{type: "function", function: {...}}
-            converted.append(tool)
-        elif tool_type == "function" and "name" in tool:
+            if tool["function"].get("name"):
+                converted.append(tool)
+            else:
+                logger.warning(f"跳过缺少 function.name 的 tool: {tool}")
+        elif tool_type == "function" and tool.get("name"):
             # Responses API 格式：{type: "function", name: "...", ...}
             func = {
                 "type": "function",
@@ -356,7 +368,7 @@ def _convert_tools(tools: list[dict]) -> list[dict]:
                 }
             }
             converted.append(func)
-        elif "name" in tool:
+        elif tool.get("name"):
             # 兼容没有 type 但有 name 的格式
             func = {
                 "type": "function",
@@ -601,13 +613,17 @@ async def stream_chat_completions(
 
 
 async def verify_admin_token(
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
     """验证配置管理 token"""
     if not config.admin_token:
-        return True  # 未设置 token 时允许访问（本地开发）
+        client_host = request.client.host if request.client else ""
+        if client_host not in ("127.0.0.1", "::1", "localhost"):
+            raise HTTPException(status_code=401, detail="非本地访问必须设置 --admin-token")
+        return True
 
-    if not credentials or credentials.credentials != config.admin_token:
+    if not credentials or not secrets.compare_digest(credentials.credentials, config.admin_token):
         raise HTTPException(status_code=401, detail="无效的认证 token")
     return True
 
