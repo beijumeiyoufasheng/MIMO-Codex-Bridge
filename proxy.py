@@ -20,8 +20,13 @@ import time
 import argparse
 import logging
 import secrets
+import shutil
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional
+from urllib.parse import urlparse
+import ipaddress
+import socket
+import re
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException, Depends
@@ -72,6 +77,7 @@ class ResponsesRequest(BaseModel):
     tools: Optional[list[dict]] = None
     tool_choice: Optional[str | dict] = None
     api_key: Optional[str] = None
+    thinking: Optional[dict] = None
 
 
 class ConfigUpdate(BaseModel):
@@ -79,12 +85,13 @@ class ConfigUpdate(BaseModel):
     api_key: Optional[str] = None
     backend_url: Optional[str] = None
     enable_thinking: Optional[bool] = None
+    thinking_budget: Optional[int] = None
     write_codex: bool = False
     model: str = "mimo-v2.5-pro"
 
 
 class ProxyConfig:
-    """代理配置（线程安全）"""
+    """代理运行配置"""
 
     def __init__(self):
         self.backend_url: str = ""
@@ -92,8 +99,10 @@ class ProxyConfig:
         self.port: int = 8888
         self.host: str = "127.0.0.1"
         self.enable_thinking: bool = True
+        self.thinking_budget: int = 10240
         self.codex_config_dir: str = ""
         self.admin_token: str = ""  # 配置管理认证 token
+        self.backend_url_is_custom: bool = False
 
     def get_codex_config_dir(self) -> Path:
         if self.codex_config_dir:
@@ -118,9 +127,36 @@ def detect_api_type(api_key: str) -> str:
 def get_backend_url(api_key: str, custom_url: str = "") -> str:
     """获取后端 URL"""
     if custom_url:
-        return custom_url
+        validate_backend_url(custom_url)
+        return custom_url.rstrip("/")
     api_type = detect_api_type(api_key)
     return MIMO_ENDPOINTS[api_type]
+
+
+def validate_backend_url(url: str) -> str:
+    """校验后端 URL，阻止明显危险的内网/本机地址"""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("https", "http") or not parsed.hostname:
+        raise ValueError("backend_url 必须是 http/https URL")
+
+    hostname = parsed.hostname.lower()
+    allowed_hosts = {urlparse(endpoint).hostname for endpoint in MIMO_ENDPOINTS.values()}
+    if hostname in allowed_hosts:
+        return url
+
+    if hostname in ("localhost", "127.0.0.1", "::1"):
+        raise ValueError("backend_url 不允许指向本机地址")
+
+    try:
+        addresses = socket.getaddrinfo(hostname, None)
+        for address in addresses:
+            ip = ipaddress.ip_address(address[4][0])
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast:
+                raise ValueError("backend_url 不允许解析到内网地址")
+    except socket.gaierror as exc:
+        raise ValueError(f"backend_url 主机无法解析: {hostname}") from exc
+
+    return url
 
 
 def read_codex_config() -> dict:
@@ -167,21 +203,85 @@ def read_codex_config() -> dict:
     return result
 
 
+def _toml_string(value: str) -> str:
+    """返回 TOML 基础字符串字面量"""
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _replace_top_level_toml_value(lines: list[str], key: str, value: str) -> tuple[list[str], bool]:
+    """替换顶层 TOML 键，避免误改表内键或相似键名"""
+    result = []
+    replaced = False
+    in_table = False
+    key_pattern = re.compile(rf"^({re.escape(key)})(\s*=)")
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_table = True
+
+        if not in_table and key_pattern.match(line.lstrip()):
+            result.append(f"{key} = {_toml_string(value)}\n")
+            replaced = True
+        else:
+            result.append(line)
+
+    return result, replaced
+
+
+def _insert_top_level_toml_value(lines: list[str], key: str, value: str) -> list[str]:
+    """在首个 TOML 表头前插入顶层键"""
+    insert_index = len(lines)
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            insert_index = index
+            break
+
+    line = f"{key} = {_toml_string(value)}\n"
+    return lines[:insert_index] + [line] + lines[insert_index:]
+
+
 def write_codex_config(api_key: str, base_url: str, model: str = "mimo-v2.5-pro"):
     """写入 Codex 配置（用于 cc-switch 集成）"""
     codex_dir = config.get_codex_config_dir()
     codex_dir.mkdir(parents=True, exist_ok=True)
 
+    timestamp = time.strftime("%Y%m%d%H%M%S")
+
     # 写入 auth.json
     auth_file = codex_dir / "auth.json"
+    if auth_file.exists():
+        shutil.copy2(auth_file, codex_dir / f"auth.json.bak.{timestamp}")
+        try:
+            with open(auth_file, "r", encoding="utf-8") as f:
+                auth = json.load(f)
+        except Exception:
+            auth = {}
+    else:
+        auth = {}
+    auth["OPENAI_API_KEY"] = api_key
     with open(auth_file, "w", encoding="utf-8") as f:
-        json.dump({"OPENAI_API_KEY": api_key}, f, indent=2)
+        json.dump(auth, f, indent=2)
 
     # 写入 config.toml
     config_file = codex_dir / "config.toml"
+    existing_lines = []
+    if config_file.exists():
+        shutil.copy2(config_file, codex_dir / f"config.toml.bak.{timestamp}")
+        with open(config_file, "r", encoding="utf-8") as f:
+            existing_lines = f.readlines()
+
+    existing_lines, has_base_url = _replace_top_level_toml_value(existing_lines, "base_url", base_url)
+    existing_lines, has_model = _replace_top_level_toml_value(existing_lines, "model", model)
+
+    if not has_base_url:
+        existing_lines = _insert_top_level_toml_value(existing_lines, "base_url", base_url)
+    if not has_model:
+        existing_lines = _insert_top_level_toml_value(existing_lines, "model", model)
+
     with open(config_file, "w", encoding="utf-8") as f:
-        f.write(f'base_url = "{base_url}"\n')
-        f.write(f'model = "{model}"\n')
+        f.writelines(existing_lines)
 
     logger.info(f"已写入 Codex 配置到 {codex_dir}")
 
@@ -220,8 +320,10 @@ def responses_to_chat_completions(body: dict) -> dict:
     }
 
     # 传递思考模式配置
-    if config.enable_thinking:
-        result["thinking"] = {"type": "enabled", "budget_tokens": 10240}
+    if "thinking" in body and body["thinking"] is not None:
+        result["thinking"] = body["thinking"]
+    elif config.enable_thinking:
+        result["thinking"] = {"type": "enabled", "budget_tokens": config.thinking_budget}
 
     # 传递其他参数
     if "temperature" in body and body["temperature"] is not None:
@@ -286,8 +388,6 @@ def _extract_content_text(content: Any) -> str:
             part_type = part.get("type")
             if part_type in ("output_text", "input_text", "text"):
                 text_parts.append(part.get("text", ""))
-            elif part_type == "function_call":
-                text_parts.append(part.get("arguments", ""))
         elif isinstance(part, str):
             text_parts.append(part)
     return "\n".join(text_parts)
@@ -436,7 +536,24 @@ def chat_response_to_responses(resp: dict) -> dict:
         "status": "completed",
         "model": resp.get("model", "mimo"),
         "output": output,
-        "usage": resp.get("usage", {}),
+        "usage": _convert_usage(resp.get("usage", {})),
+    }
+
+
+def _convert_usage(usage: dict) -> dict:
+    """转换 Chat Completions usage 到 Responses API usage"""
+    if not usage:
+        return {}
+    if "input_tokens" in usage or "output_tokens" in usage:
+        return usage
+
+    input_tokens = usage.get("prompt_tokens", 0)
+    output_tokens = usage.get("completion_tokens", 0)
+    total_tokens = usage.get("total_tokens", input_tokens + output_tokens)
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
     }
 
 
@@ -459,6 +576,84 @@ def _merge_tool_call_deltas(collected_tool_calls: list[dict], tool_call_deltas: 
             target_function["name"] += function_delta["name"]
         if function_delta.get("arguments"):
             target_function["arguments"] += function_delta["arguments"]
+
+
+def _stream_message_item(message_id: str, collected_reasoning: list[str], collected_content: list[str]) -> dict:
+    """构建完整的 Responses message output item"""
+    item = {
+        "type": "message",
+        "id": message_id,
+        "role": "assistant",
+        "status": "completed",
+        "content": [],
+    }
+    if collected_reasoning:
+        item["content"].append({
+            "type": "reasoning_text",
+            "text": "".join(collected_reasoning),
+        })
+    if collected_content:
+        item["content"].append({
+            "type": "output_text",
+            "text": "".join(collected_content),
+            "annotations": [],
+        })
+    return item
+
+
+def _build_stream_completed_response(
+    response_id: str,
+    message_id: str,
+    payload: dict,
+    collected_reasoning: list[str],
+    collected_content: list[str],
+    collected_tool_calls: list[dict],
+) -> dict:
+    """构建流式完成响应"""
+    completed_response = {
+        "id": response_id,
+        "object": "response",
+        "created_at": int(time.time()),
+        "status": "completed",
+        "model": payload.get("model", "mimo"),
+        "output": [_stream_message_item(message_id, collected_reasoning, collected_content)],
+    }
+    if collected_tool_calls:
+        completed_response["output"].extend(_chat_tool_call_to_responses(tc) for tc in collected_tool_calls)
+    return completed_response
+
+
+def _redact_api_key(api_key: str) -> str:
+    """短格式脱敏 API Key"""
+    if not api_key:
+        return ""
+    return f"{api_key[:4]}..."
+
+
+async def _stream_error(
+    error_type: str,
+    message: str,
+    response_id: str,
+    payload: dict,
+    code: Optional[int] = None,
+) -> AsyncIterator[str]:
+    """发送流式错误事件并关闭响应"""
+    error = {"type": error_type, "message": message}
+    if code is not None:
+        error["code"] = code
+
+    yield f"data: {json.dumps({'type': 'response.error', 'error': error}, ensure_ascii=False)}\n\n"
+    failed_response = {
+        "id": response_id,
+        "object": "response",
+        "created_at": int(time.time()),
+        "status": "failed",
+        "model": payload.get("model", "mimo"),
+        "output": [],
+        "error": error,
+    }
+    yield f"data: {json.dumps({'type': 'response.failed', 'response': failed_response}, ensure_ascii=False)}\n\n"
+    yield "data: [DONE]\n\n"
 
 
 async def stream_chat_completions(
@@ -492,8 +687,14 @@ async def stream_chat_completions(
                     error_body = await response.aread()
                     error_msg = error_body.decode("utf-8", errors="replace")
                     logger.error(f"后端返回错误 {response.status_code}: {error_msg}")
-                    yield f"data: {json.dumps({'type': 'response.error', 'error': {'type': 'backend_error', 'code': response.status_code, 'message': error_msg}}, ensure_ascii=False)}\n\n"
-                    yield "data: [DONE]\n\n"
+                    async for event in _stream_error(
+                        "backend_error",
+                        error_msg,
+                        response_id,
+                        payload,
+                        code=response.status_code,
+                    ):
+                        yield event
                     return
 
                 async for line in response.aiter_lines():
@@ -549,7 +750,8 @@ async def stream_chat_completions(
                             elif has_reasoning:
                                 yield f"data: {json.dumps({'type': 'response.content_part.done', 'output_index': 0, 'content_index': 0, 'part': {'type': 'reasoning_text', 'text': ''.join(collected_reasoning)}}, ensure_ascii=False)}\n\n"
 
-                            yield f"data: {json.dumps({'type': 'response.output_item.done', 'output_index': 0, 'item': {'type': 'message', 'id': message_id, 'role': 'assistant', 'status': 'completed', 'content': []}}, ensure_ascii=False)}\n\n"
+                            message_item = _stream_message_item(message_id, collected_reasoning, collected_content)
+                            yield f"data: {json.dumps({'type': 'response.output_item.done', 'output_index': 0, 'item': message_item}, ensure_ascii=False)}\n\n"
 
                             for tool_index, tool_call in enumerate(collected_tool_calls, start=1):
                                 responses_tool_call = _chat_tool_call_to_responses(tool_call)
@@ -561,50 +763,28 @@ async def stream_chat_completions(
 
         except httpx.ConnectError as e:
             logger.error(f"连接后端失败: {e}")
-            yield f"data: {json.dumps({'type': 'response.error', 'error': {'type': 'connection_error', 'message': f'连接后端失败: {str(e)}'}}, ensure_ascii=False)}\n\n"
-            yield "data: [DONE]\n\n"
+            async for event in _stream_error("connection_error", f"连接后端失败: {str(e)}", response_id, payload):
+                yield event
             return
         except httpx.TimeoutException as e:
             logger.error(f"请求超时: {e}")
-            yield f"data: {json.dumps({'type': 'response.error', 'error': {'type': 'timeout_error', 'message': f'请求超时: {str(e)}'}}, ensure_ascii=False)}\n\n"
-            yield "data: [DONE]\n\n"
+            async for event in _stream_error("timeout_error", f"请求超时: {str(e)}", response_id, payload):
+                yield event
             return
         except Exception as e:
             logger.error(f"流式处理异常: {e}")
-            yield f"data: {json.dumps({'type': 'response.error', 'error': {'type': 'internal_error', 'message': str(e)}}, ensure_ascii=False)}\n\n"
-            yield "data: [DONE]\n\n"
+            async for event in _stream_error("internal_error", str(e), response_id, payload):
+                yield event
             return
 
-        # 发送 response.completed 事件
-        completed_response = {
-            "id": response_id,
-            "object": "response",
-            "created_at": int(time.time()),
-            "status": "completed",
-            "model": payload.get("model", "mimo"),
-            "output": [{
-                "type": "message",
-                "id": message_id,
-                "role": "assistant",
-                "status": "completed",
-                "content": [],
-            }],
-        }
-
-        if collected_reasoning:
-            completed_response["output"][0]["content"].append({
-                "type": "reasoning_text",
-                "text": "".join(collected_reasoning),
-            })
-        if collected_content:
-            completed_response["output"][0]["content"].append({
-                "type": "output_text",
-                "text": "".join(collected_content),
-                "annotations": [],
-            })
-        if collected_tool_calls:
-            completed_response["output"].extend(_chat_tool_call_to_responses(tc) for tc in collected_tool_calls)
-
+        completed_response = _build_stream_completed_response(
+            response_id,
+            message_id,
+            payload,
+            collected_reasoning,
+            collected_content,
+            collected_tool_calls,
+        )
         yield f"data: {json.dumps({'type': 'response.completed', 'response': completed_response}, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
     finally:
@@ -656,16 +836,24 @@ async def update_config(
     # 更新 API Key
     if body.api_key:
         config.api_key = body.api_key
-        if not config.backend_url:
+        if not body.backend_url and not config.backend_url_is_custom:
             config.backend_url = get_backend_url(config.api_key)
 
     # 更新后端 URL
     if body.backend_url:
-        config.backend_url = body.backend_url
+        try:
+            config.backend_url = validate_backend_url(body.backend_url).rstrip("/")
+            config.backend_url_is_custom = True
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # 更新思考模式
     if body.enable_thinking is not None:
         config.enable_thinking = body.enable_thinking
+    if body.thinking_budget is not None:
+        if body.thinking_budget <= 0:
+            raise HTTPException(status_code=400, detail="thinking_budget 必须大于 0")
+        config.thinking_budget = body.thinking_budget
 
     # 写入 Codex 配置
     if body.write_codex and config.api_key:
@@ -717,6 +905,7 @@ async def handle_responses(request: Request):
         )
 
     # 转换为 Chat Completions 格式
+    body = req.model_dump(exclude_none=True)
     chat_payload = responses_to_chat_completions(body)
 
     # 构建后端请求
@@ -728,48 +917,40 @@ async def handle_responses(request: Request):
 
     logger.info(f"转发请求到 {url} (stream={req.stream})")
 
-    # 注意：流式响应时不能使用 async with，因为客户端会在 StreamingResponse 返回前被关闭
-    client = httpx.AsyncClient(timeout=300.0)
+    if chat_payload.get("stream"):
+        client = httpx.AsyncClient(timeout=300.0)
+        return StreamingResponse(
+            stream_chat_completions(client, url, headers, chat_payload),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     try:
-        if chat_payload.get("stream"):
-            # 流式响应 - 客户端会在生成器内部关闭
-            return StreamingResponse(
-                stream_chat_completions(client, url, headers, chat_payload),
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",
-                },
-            )
-        else:
-            # 非流式响应
-            try:
-                resp = await client.post(url, json=chat_payload, headers=headers)
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            resp = await client.post(url, json=chat_payload, headers=headers)
 
-                if resp.status_code != 200:
-                    error_text = resp.text
-                    logger.error(f"后端返回错误 {resp.status_code}: {error_text}")
-                    raise HTTPException(
-                        status_code=resp.status_code,
-                        detail=f"后端错误: {error_text}",
-                    )
+            if resp.status_code != 200:
+                error_text = resp.text
+                logger.error(f"后端返回错误 {resp.status_code}: {error_text}")
+                raise HTTPException(
+                    status_code=resp.status_code,
+                    detail=f"后端错误: {error_text}",
+                )
 
-                chat_result = resp.json()
-                responses_result = chat_response_to_responses(chat_result)
-                return JSONResponse(content=responses_result)
+            chat_result = resp.json()
+            responses_result = chat_response_to_responses(chat_result)
+            return JSONResponse(content=responses_result)
 
-            except httpx.ConnectError as e:
-                logger.error(f"连接后端失败: {e}")
-                raise HTTPException(status_code=502, detail=f"连接后端失败: {str(e)}")
-            except httpx.TimeoutException as e:
-                logger.error(f"请求超时: {e}")
-                raise HTTPException(status_code=504, detail=f"请求超时: {str(e)}")
-            finally:
-                await client.aclose()
-    except Exception:
-        await client.aclose()
-        raise
+    except httpx.ConnectError as e:
+        logger.error(f"连接后端失败: {e}")
+        raise HTTPException(status_code=502, detail=f"连接后端失败: {str(e)}")
+    except httpx.TimeoutException as e:
+        logger.error(f"请求超时: {e}")
+        raise HTTPException(status_code=504, detail=f"请求超时: {str(e)}")
 
 
 @app.get("/v1/models")
@@ -889,7 +1070,11 @@ cc-switch 集成:
     args = parser.parse_args()
 
     config.api_key = args.api_key
-    config.backend_url = args.backend
+    try:
+        config.backend_url = validate_backend_url(args.backend).rstrip("/") if args.backend else ""
+    except ValueError as exc:
+        raise SystemExit(f"backend 参数无效: {exc}")
+    config.backend_url_is_custom = bool(args.backend)
     config.port = args.port
     config.host = args.host
     config.enable_thinking = not args.no_thinking
@@ -928,7 +1113,7 @@ cc-switch 集成:
         )
         print()
         print("已写入 Codex 配置:")
-        print(f"   API Key: {config.api_key[:10]}...")
+        print(f"   API Key: {_redact_api_key(config.api_key)}")
         print(f"   Base URL: http://{config.host}:{config.port}/v1")
 
     print()
