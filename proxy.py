@@ -33,7 +33,7 @@ import uvicorn
 
 # 配置日志
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
@@ -263,11 +263,21 @@ def responses_to_chat_completions(body: dict) -> dict:
 def _convert_tools(tools: list[dict]) -> list[dict]:
     """转换 Responses API tools 格式到 Chat Completions 格式"""
     converted = []
+    # 不支持的 tool 类型
+    unsupported_types = {"web_search", "code_interpreter", "file_search"}
+
     for tool in tools:
+        tool_type = tool.get("type", "")
+
+        # 跳过不支持的类型
+        if tool_type in unsupported_types:
+            logger.debug(f"跳过不支持的 tool 类型: {tool_type}")
+            continue
+
         if "function" in tool and isinstance(tool["function"], dict):
             # 已经是 Chat Completions 格式：{type: "function", function: {...}}
             converted.append(tool)
-        elif tool.get("type") == "function" and "name" in tool:
+        elif tool_type == "function" and "name" in tool:
             # Responses API 格式：{type: "function", name: "...", ...}
             func = {
                 "type": "function",
@@ -278,9 +288,20 @@ def _convert_tools(tools: list[dict]) -> list[dict]:
                 }
             }
             converted.append(func)
+        elif "name" in tool:
+            # 兼容没有 type 但有 name 的格式
+            func = {
+                "type": "function",
+                "function": {
+                    "name": tool.get("name", ""),
+                    "description": tool.get("description", ""),
+                    "parameters": tool.get("parameters", {}),
+                }
+            }
+            converted.append(func)
         else:
-            # 尝试兼容其他格式
-            converted.append(tool)
+            logger.warning(f"跳过无法识别的 tool 格式: {tool}")
+
     return converted
 
 
@@ -593,6 +614,7 @@ async def handle_responses(request: Request):
     }
 
     logger.info(f"转发请求到 {url} (stream={req.stream})")
+    logger.debug(f"请求体: {json.dumps(chat_payload, ensure_ascii=False, indent=2)}")
 
     # 注意：流式响应时不能使用 async with，因为客户端会在 StreamingResponse 返回前被关闭
     client = httpx.AsyncClient(timeout=300.0)
